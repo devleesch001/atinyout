@@ -1,0 +1,128 @@
+#!/bin/sh
+
+# === CONFIGURATION ===
+PORT="${PORT:-/dev/ttyUSB2}"
+BAUD="${BAUD:-115200}"
+TIMEOUT="${TIMEOUT:-2}"
+
+# === OPTIONS HANDLING ===
+RAW_MODE=0
+CMD=""
+
+# Help function
+usage() {
+    echo "\
+AT Command Wrapper - A lightweight alternative to 'atinout'.
+Sends AT commands via 'socat' and returns clean, script-ready data.
+
+Usage: $0 [OPTIONS] <AT_Command>
+
+    Options:
+      -h, --help    Show this help message and exit
+      -r, --raw     Show the raw response from the modem
+
+    Examples:
+      $0 AT+CCID
+      $0 -r AT+CGSN
+      $0 --raw AT+CIMI
+" >&2
+    exit 1
+}
+
+# Parse command line arguments
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -h | --help)
+        usage
+        ;;
+    -r | --raw)
+        RAW_MODE=1
+        shift
+        ;;
+    -*)
+        echo "Error: Unknown option: $1" >&2
+        usage
+        ;;
+    *)
+        # Stop parsing options, the rest is the AT command
+        CMD="$1"
+        break
+        ;;
+    esac
+done
+
+# === ARGUMENTS CHECK ===
+if [ -z "$CMD" ]; then
+    echo "Error: No command provided." >&2
+    usage
+fi
+
+# === FUNCTION 1 : SEND COMMAND ===
+send_at_command() {
+    cmd="$1"
+    # The crnl option handles carriage returns, using socat to query the port
+    echo "$cmd" | socat -t "$TIMEOUT" - "$PORT,b$BAUD,raw,echo=0,crnl"
+}
+
+# === FUNCTION 2 : PARSE RESPONSE (NORMAL MODE) ===
+parse_at_response() {
+    raw_data="$1"
+    original_cmd="$2"
+
+    # === AT RESPONSE PIPELINE CLEANUP ===
+    # This pipeline extracts the core payload from a standard AT command response.
+    # Expected structure: [COMMAND]\r\n [RESPONSE_DATA] \r\nOK
+    #
+    # 1. tr -d '\r'  : Strips Windows-style carriage returns for clean UNIX processing.
+    # 2. awk         : Implements a state machine to isolate data:
+    #    - Starts capturing only AFTER the original command ($original_cmd) is echoed.
+    #    - Aborts and prints a specific flag if "ERROR" is detected.
+    #    - Gracefully exits once the "OK" terminator is reached.
+    #    - Only prints lines that contain data (NF > 0) during the capture phase.
+    # 3. tr -d ' '   : Removes any residual whitespace/spaces from the final output.
+
+    clean_data=$(echo "$raw_data" | tr -d '\r' | awk -v cmd="$original_cmd" '
+        $0 == cmd { capture=1; next }
+        capture && /^ERROR$/ { print "_CMD_ERROR_"; exit }
+        capture && /^OK$/ { exit }
+        capture && NF { print }
+    ' | tr -d ' ')
+
+    # Check if _CMD_ERROR_ is present anywhere in the captured data
+    if echo "$clean_data" | grep -q "_CMD_ERROR_"; then
+        echo "Error: The modem returned an ERROR for '$original_cmd'." >&2
+
+        # Remove the _CMD_ERROR_ line so clean_data only contains the actual returned data
+        clean_data=$(echo "$clean_data" | grep -v "_CMD_ERROR_")
+
+        # If there is partial data available, print it to stdout
+        if [ -n "$clean_data" ]; then
+            echo "$clean_data"
+        fi
+
+        return 1 # Ensure the script exits with an error status
+    fi
+
+    # Normal success case (OK)
+    if [ -z "$clean_data" ]; then
+        echo "No data returned (OK)." >&2
+    else
+        echo "$clean_data"
+    fi
+}
+# === MAIN EXECUTION ===
+
+# 1. Query the modem (store the raw result)
+RAW_RESPONSE=$(send_at_command "$CMD")
+
+# 2. Display based on the selected mode
+if [ "$RAW_MODE" -eq 1 ]; then
+    # RAW MODE (-r or --raw) : Display the response as is
+    # Keeping a 'tr -d \r' just to keep the terminal output clean
+    echo "$RAW_RESPONSE" | tr -d '\r'
+else
+    # NORMAL MODE : Clean and display
+    parse_at_response "$RAW_RESPONSE" "$CMD"
+fi
+
+exit 0
